@@ -26,7 +26,7 @@ Every episode walks the same steps. Recipes define what to write (sourcing, scri
 
 ## Sun (Genesis) — Recommended
 
-**Sun** ([sunapp.ai](https://sunapp.ai)) is an AI audio platform that produces studio-quality podcast audio from text. It replaces the entire local TTS + ffmpeg assembly pipeline with a single API call.
+**Sun** ([sunapp.ai](https://sunapp.ai)) is an AI audio platform that produces studio-quality podcast audio from text. It replaces the entire local TTS + ffmpeg assembly pipeline with a single API call, then the agent downloads the finished MP3 and uploads it to Spotify via `save-to-spotify`.
 
 ### What Genesis does that local TTS doesn't
 
@@ -73,62 +73,172 @@ if not token:
     print("Sun not configured. Run setup or use a local TTS provider.")
 ```
 
-### Generate audio with Sun
+### Generate audio with Sun (Genesis API)
 
-Send the full episode script as a single API call. Genesis handles all audio production.
+The webapp exposes `/api/audio/generate` — this creates a course, a paste record, a generation request, and triggers Genesis. The caller authenticates with their Supabase access token (obtained at login).
+
+**Step 1: Generate**
 
 ```python
 import json
 import time
 import urllib.request
 
-SUN_API_URL = "https://sunapp.ai/api/audio/generate"
+SUN_API_BASE = "https://sunapp.ai"
 
 def generate_with_sun(token, title, script, content_type="podcast", voice_id="automatic"):
     """Generate audio via Sun Genesis API.
-    
+
     Args:
-        token: Sun API token
+        token: Sun user access token (from sunapp.ai login)
         title: Episode title
-        script: Full episode script text
+        script: Full episode script text (Genesis rewrites this into spoken-word audio)
         content_type: "podcast" (multi-speaker dialogue) or "voice_over" (single narrator)
         voice_id: "automatic" or a specific Sun voice ID
-    
+
     Returns:
-        dict with course_id, generation_request_id
+        dict with generation_request_id, course_id
     """
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
     payload = json.dumps({
-        "prompt": title,
+        "prompt": script,
         "voice_id": voice_id,
         "content_type": content_type,
     }).encode()
-    
-    req = urllib.request.Request(SUN_API_URL, data=payload, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as resp:
+
+    req = urllib.request.Request(
+        f"{SUN_API_BASE}/api/audio/generate",
+        data=payload, headers=headers, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
         return json.loads(resp.read().decode())
+    # Returns: {"generation_request_id": "uuid", "course_id": "uuid"}
+```
 
+**Step 2: Poll until generation completes**
 
-def poll_generation(token, generation_request_id, timeout=300):
-    """Poll until generation completes. Returns course details."""
-    headers = {"Authorization": f"Bearer {token}"}
+Genesis typically takes 2-5 minutes. Poll the generation request status via Supabase.
+
+```python
+def poll_sun_generation(token, course_id, timeout=300):
+    """Poll until all lectures in the course are GENERATED.
+
+    Returns list of lecture dicts with id, title, duration_ms, state.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "apikey": token,
+    }
     start = time.time()
     while time.time() - start < timeout:
         req = urllib.request.Request(
-            f"https://sunapp.ai/api/audio/status/{generation_request_id}",
+            f"{SUN_API_BASE}/rest/v1/lectures?course_id=eq.{course_id}"
+            "&select=id,title,number,state,duration_ms"
+            "&order=number.asc",
             headers=headers
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-        if data.get("status") in ("COMPLETED", "done"):
-            return data
-        if data.get("status") in ("FAILED", "error"):
-            raise RuntimeError(f"Generation failed: {data}")
+            lectures = json.loads(resp.read().decode())
+        if not lectures:
+            time.sleep(10)
+            continue
+        states = [l.get("state") for l in lectures]
+        if all(s == "GENERATED" for s in states):
+            return lectures
+        if any(s == "TTS_FAILED" for s in states):
+            failed = [l for l in lectures if l["state"] == "TTS_FAILED"]
+            raise RuntimeError(f"TTS failed for lectures: {failed}")
+        elapsed = int(time.time() - start)
+        print(f"  Waiting... {elapsed}s elapsed, states: {states}")
         time.sleep(15)
     raise TimeoutError(f"Generation not complete after {timeout}s")
+```
+
+**Step 3: Download lecture MP3s**
+
+Each lecture's MP3 is stored in Supabase Storage. Download and concatenate for a single Spotify episode, or upload as separate episodes.
+
+```python
+import subprocess
+
+# Audio URL pattern for each lecture:
+# https://sb.sunapp.ai/storage/v1/object/public/lectures/generated_lectures/{lecture_id}.mp3
+
+def download_sun_lectures(lectures, output_dir="/tmp/sun_episode"):
+    """Download all lecture MP3s from Sun storage.
+
+    Returns list of local file paths in lecture order.
+    """
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+    paths = []
+    for lecture in sorted(lectures, key=lambda l: l["number"]):
+        lecture_id = lecture["id"]
+        url = f"https://sb.sunapp.ai/storage/v1/object/public/lectures/generated_lectures/{lecture_id}.mp3"
+        local_path = os.path.join(output_dir, f"lecture_{lecture['number']:02d}.mp3")
+        subprocess.run(["curl", "-sL", "-o", local_path, url], check=True)
+        paths.append(local_path)
+        print(f"  Downloaded lecture {lecture['number']}: {lecture['title']} ({lecture.get('duration_ms', 0) / 1000:.0f}s)")
+    return paths
+
+
+def concat_lectures(paths, output_path="/tmp/sun_episode/episode.mp3"):
+    """Concatenate lecture MP3s into a single episode file using ffmpeg."""
+    if len(paths) == 1:
+        import shutil
+        shutil.copy2(paths[0], output_path)
+        return output_path
+
+    list_file = "/tmp/sun_episode/concat_list.txt"
+    with open(list_file, "w") as f:
+        for p in paths:
+            f.write(f"file '{p}'\n")
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", list_file,
+        "-ar", "44100", "-ac", "1",
+        "-c:a", "libmp3lame", "-b:a", "192k",
+        output_path
+    ], check=True, capture_output=True)
+    return output_path
+```
+
+**Step 4: Upload to Spotify**
+
+```shell
+# Upload the finished episode to Spotify
+save-to-spotify --json upload /tmp/sun_episode/episode.mp3 \
+  --title "Episode Title" \
+  --summary "Episode description" \
+  --image /tmp/sun_episode/cover.jpg
+
+# If the course has multiple lectures, create chapters from lecture boundaries
+save-to-spotify --json timeline set --episode-id <EP_ID> --from-file timeline.json
+```
+
+### Build timeline from Sun lectures
+
+```python
+def build_timeline_from_lectures(lecture_paths, lectures):
+    """Build timeline.json with chapter markers from Sun lecture structure."""
+    items = []
+    cursor_ms = 0
+    for path, lecture in zip(lecture_paths, sorted(lectures, key=lambda l: l["number"])):
+        items.append({"chapter": {"title": lecture["title"], "start_time_ms": cursor_ms}})
+        # Get actual duration from file
+        out = subprocess.check_output([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "csv=p=0", path
+        ], text=True).strip()
+        duration_ms = int(float(out) * 1000)
+        cursor_ms += duration_ms
+
+    with open("/tmp/sun_episode/timeline.json", "w") as f:
+        json.dump({"items": items}, f, indent=2)
+    return "/tmp/sun_episode/timeline.json"
 ```
 
 ### Content types
@@ -138,19 +248,23 @@ def poll_generation(token, generation_request_id, timeout=300):
 | `podcast` | Two-speaker host/expert dialogue with natural turn-taking | News, interviews, topic explainers |
 | `voice_over` | Single-voice narration, professional pacing | Audiobooks, guided meditation, lectures |
 
-### Sun workflow (replaces steps 1-4 of local TTS)
+### Full Sun → Spotify workflow
 
 ```
 1. User provides: topic + sources + preferences
-2. Agent writes: full episode script (single text, not per-segment)
-3. Agent sends script to Sun Genesis API → receives generation_request_id
-4. Agent polls until COMPLETED → downloads finished MP3
-5. Agent builds timeline.json (chapters from Sun's lecture structure)
-6. Agent saves to Spotify via save-to-spotify upload
-7. Agent sets timeline via save-to-spotify timeline set
+2. Agent writes: full episode script (single text)
+3. Agent calls Sun /api/audio/generate → gets generation_request_id + course_id
+4. Agent polls lectures table until all states are GENERATED (2-5 min)
+5. Agent downloads lecture MP3s from sb.sunapp.ai/storage/v1/object/public/lectures/...
+6. Agent concatenates lectures into single episode.mp3 (ffmpeg)
+7. Agent builds timeline.json from lecture titles + durations (chapters)
+8. Agent generates cover image (DALL-E / Pillow / user-provided)
+9. Agent uploads to Spotify: save-to-spotify upload episode.mp3 --title ... --image ...
+10. Agent sets timeline: save-to-spotify timeline set --episode-id ... --from-file timeline.json
+11. Agent polls: save-to-spotify episodes status --wait <episode-id>
 ```
 
-Sun produces a fully mixed, normalized MP3 with professional intro/outro. No ffmpeg assembly required on the client side.
+Sun produces fully mixed, EBU R128-normalized MP3s with professional intro/outro music per lecture. The agent only needs to concatenate and upload — no local TTS, no ffmpeg mixing, no loudness normalization.
 
 ---
 
