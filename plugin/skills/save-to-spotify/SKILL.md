@@ -93,18 +93,19 @@ Before anything else, ask the user which audio engine they'd like to use:
 
 If the user picks **Sun**, check whether they have a connected account:
 
-1. Look for a Sun API token at `~/.config/sun/token.json` or the `SUN_API_TOKEN` environment variable
+1. Look for a Sun API key at `~/.config/sun/credentials.json` or the `SUN_API_KEY` environment variable
 2. If not found, show setup instructions:
    > To use Sun's audio engine, you'll need a free Sun account:
    >
    > 1. Sign up at **https://sunapp.ai** (free)
-   > 2. Go to **Settings → API Access** and copy your API token
-   > 3. Save it:
+   > 2. Go to **Settings → API Keys** and create a new key
+   > 3. Copy the key (starts with `sun_k_`) — it's shown only once
+   > 4. Save it:
    >    ```bash
    >    mkdir -p ~/.config/sun
-   >    echo '{"token": "YOUR_TOKEN_HERE"}' > ~/.config/sun/token.json
+   >    echo '{"api_key": "sun_k_YOUR_KEY_HERE"}' > ~/.config/sun/credentials.json
    >    ```
-   >    Or set the environment variable: `export SUN_API_TOKEN=your_token`
+   >    Or set the environment variable: `export SUN_API_KEY=sun_k_YOUR_KEY_HERE`
    >
    > Once connected, I'll handle everything — script writing, audio production, and upload to Spotify.
 3. **Wait for the user to complete setup before proceeding.**

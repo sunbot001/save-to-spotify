@@ -40,15 +40,16 @@ Every episode walks the same steps. Recipes define what to write (sourcing, scri
 ### Setup
 
 1. Create a free account at [sunapp.ai](https://sunapp.ai)
-2. Go to **Settings → API Access** and copy your API token
-3. Save your token:
+2. Go to **Settings → API Keys** and create a new key
+3. You'll see a key like `sun_k_AbCdEfGh...` — **copy it immediately**, it's shown only once
+4. Save your key:
    ```bash
    mkdir -p ~/.config/sun
-   echo '{"token": "YOUR_TOKEN_HERE"}' > ~/.config/sun/token.json
+   echo '{"api_key": "sun_k_YOUR_KEY_HERE"}' > ~/.config/sun/credentials.json
    ```
    Or set the environment variable:
    ```bash
-   export SUN_API_TOKEN=your_token
+   export SUN_API_KEY=sun_k_YOUR_KEY_HERE
    ```
 
 ### Authentication check
@@ -57,25 +58,25 @@ Every episode walks the same steps. Recipes define what to write (sourcing, scri
 import json, os
 from pathlib import Path
 
-def get_sun_token():
-    """Load Sun API token from config file or environment."""
-    env_token = os.environ.get("SUN_API_TOKEN")
-    if env_token:
-        return env_token
-    token_path = Path.home() / ".config" / "sun" / "token.json"
-    if token_path.exists():
-        data = json.loads(token_path.read_text())
-        return data.get("token")
+def get_sun_api_key():
+    """Load Sun API key from config file or environment."""
+    env_key = os.environ.get("SUN_API_KEY")
+    if env_key:
+        return env_key
+    cred_path = Path.home() / ".config" / "sun" / "credentials.json"
+    if cred_path.exists():
+        data = json.loads(cred_path.read_text())
+        return data.get("api_key")
     return None
 
-token = get_sun_token()
-if not token:
+api_key = get_sun_api_key()
+if not api_key:
     print("Sun not configured. Run setup or use a local TTS provider.")
 ```
 
 ### Generate audio with Sun (Genesis API)
 
-The webapp exposes `/api/audio/generate` — this creates a course, a paste record, a generation request, and triggers Genesis. The caller authenticates with their Supabase access token (obtained at login).
+The app-backend exposes `/api/v0/paste-generation` — this creates a course, paste records, a generation request, and triggers Genesis. Authenticate with your Sun API key.
 
 **Step 1: Generate**
 
@@ -84,58 +85,60 @@ import json
 import time
 import urllib.request
 
-SUN_API_BASE = "https://sunapp.ai"
+SUN_API_BASE = "https://api.sunapp.ai"  # app-backend
 
-def generate_with_sun(token, title, script, content_type="podcast", voice_id="automatic"):
+def generate_with_sun(api_key, title, script, content_type="podcast", voice_id=None):
     """Generate audio via Sun Genesis API.
 
     Args:
-        token: Sun user access token (from sunapp.ai login)
+        api_key: Sun API key (sun_k_...)
         title: Episode title
         script: Full episode script text (Genesis rewrites this into spoken-word audio)
         content_type: "podcast" (multi-speaker dialogue) or "voice_over" (single narrator)
-        voice_id: "automatic" or a specific Sun voice ID
+        voice_id: None for automatic, or a specific Sun voice ID
 
     Returns:
-        dict with generation_request_id, course_id
+        dict with course_id, generation_request_id, paste_ids
     """
     headers = {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     payload = json.dumps({
-        "prompt": script,
+        "pastes": [{"title": title, "content": script}],
         "voice_id": voice_id,
         "content_type": content_type,
     }).encode()
 
     req = urllib.request.Request(
-        f"{SUN_API_BASE}/api/audio/generate",
+        f"{SUN_API_BASE}/api/v0/paste-generation",
         data=payload, headers=headers, method="POST"
     )
     with urllib.request.urlopen(req, timeout=60) as resp:
         return json.loads(resp.read().decode())
-    # Returns: {"generation_request_id": "uuid", "course_id": "uuid"}
+    # Returns: {"course_id": "uuid", "generation_request_id": "uuid", "paste_ids": ["uuid"]}
 ```
 
 **Step 2: Poll until generation completes**
 
-Genesis typically takes 2-5 minutes. Poll the generation request status via Supabase.
+Genesis typically takes 2-5 minutes. Poll the lecture states via Supabase REST.
 
 ```python
-def poll_sun_generation(token, course_id, timeout=300):
+SUPABASE_URL = "https://sb.sunapp.ai"
+
+def poll_sun_generation(api_key, course_id, timeout=300):
     """Poll until all lectures in the course are GENERATED.
 
     Returns list of lecture dicts with id, title, duration_ms, state.
     """
     headers = {
-        "Authorization": f"Bearer {token}",
-        "apikey": token,
+        "Authorization": f"Bearer {api_key}",
+        "apikey": api_key,
     }
     start = time.time()
     while time.time() - start < timeout:
         req = urllib.request.Request(
-            f"{SUN_API_BASE}/rest/v1/lectures?course_id=eq.{course_id}"
+            f"{SUPABASE_URL}/rest/v1/lectures?course_id=eq.{course_id}"
             "&select=id,title,number,state,duration_ms"
             "&order=number.asc",
             headers=headers
